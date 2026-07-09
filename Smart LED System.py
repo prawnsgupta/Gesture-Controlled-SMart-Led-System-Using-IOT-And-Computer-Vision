@@ -5,6 +5,7 @@ import time
 import math
 import collections
 import numpy as np
+import csv
 
 # ==========================
 # ESP32 SERIAL CONFIGURATION
@@ -184,6 +185,103 @@ pir_val = 0    # Default no motion detected
 acs_val = 0    # Default raw current sensor reading
 relay_state = "OFF" # Default relay state
 
+# =========================================================
+# NEW FEATURES: MUSIC REACTIVE & EMERGENCY MODES SETUP
+# =========================================================
+
+# Emergency variables
+security_mode_enabled = False
+emergency_active = False
+emergency_trigger_time = 0.0
+emergency_counter = 0
+pre_emergency_mode = "NORMAL"
+pre_emergency_light_on = True
+pre_emergency_relay_state = "OFF"
+
+# CSV logging helper
+def log_emergency_event(trigger_time, duration):
+    lt = time.localtime(trigger_time)
+    date_str = time.strftime("%Y-%m-%d", lt)
+    time_str = time.strftime("%H:%M:%S", lt)
+    try:
+        # Check if file exists to write headers
+        file_exists = False
+        try:
+            with open("emergency_log.csv", "r") as check_f:
+                file_exists = True
+        except FileNotFoundError:
+            pass
+
+        with open("emergency_log.csv", mode="a", newline="") as log_file:
+            writer = csv.writer(log_file)
+            if not file_exists:
+                writer.writerow(["Date", "Time", "Duration (seconds)"])
+            writer.writerow([date_str, time_str, f"{duration:.1f}"])
+        print(f"Logged Emergency Event to CSV: {date_str} {time_str} ({duration:.1f}s)")
+    except Exception as e:
+        print(f"Error logging emergency event: {e}")
+
+# Trigger Emergency Mode
+def trigger_emergency():
+    global emergency_active, current_mode, pre_emergency_mode, emergency_trigger_time, emergency_counter
+    global pre_emergency_light_on, pre_emergency_relay_state, status_message, status_msg_time, light_on, relay_state
+    if emergency_active:
+        return
+
+    emergency_active = True
+    pre_emergency_mode = current_mode
+    pre_emergency_light_on = light_on
+    pre_emergency_relay_state = relay_state
+
+    current_mode = "EMERGENCY"
+    emergency_trigger_time = time.time()
+    emergency_counter += 1
+
+    light_on = True
+    relay_state = "ON"
+
+    # Send physical outputs trigger to ESP32
+    send_command("MODE_EMERGENCY")
+
+    # Update Blynk Vpins via ESP32
+    send_command("B_WRITE,21,255") # Emergency status LED (255)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(emergency_trigger_time))
+    evt_msg = f"Emergency Alert: Motion detected while security mode is active. Time: {timestamp}"
+    send_command(f"B_WRITE,22,{evt_msg}") # Notification string
+    send_command(f"B_WRITE,23,{emergency_counter}") # Emergency Counter
+
+    status_message = "EMERGENCY ACTIVE"
+    status_msg_time = time.time()
+
+# Clear Emergency Mode
+def clear_emergency():
+    global emergency_active, current_mode, pre_emergency_mode, light_on, relay_state, status_message, status_msg_time
+    if not emergency_active:
+        return
+
+    emergency_active = False
+    duration = time.time() - emergency_trigger_time
+    log_emergency_event(emergency_trigger_time, duration)
+
+    # Clear status LED on Blynk
+    send_command("B_WRITE,21,0")
+
+    # Restore pre-emergency states
+    current_mode = pre_emergency_mode
+    light_on = pre_emergency_light_on
+    relay_state = pre_emergency_relay_state
+
+    send_command(f"MODE_{current_mode}")
+    if light_on:
+        send_command("LIGHT_ON")
+        send_command("RELAY_ON")
+    else:
+        send_command("LIGHT_OFF")
+        send_command("RELAY_OFF")
+
+    status_message = f"EMERGENCY CLEARED -> MODE: {current_mode}"
+    status_msg_time = time.time()
+
 # ==========================
 # MAIN LOOP
 # ==========================
@@ -196,6 +294,11 @@ while True:
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Emergency automatic deactivation check (clear if no motion for 30s)
+    if emergency_active:
+        if time.time() - last_motion_time > 30.0:
+            clear_emergency()
 
     # Energy Saving Mode: Automatic brightness based on ambient light
     if current_mode == "ENERGY":
@@ -216,8 +319,25 @@ while True:
                 if line:
                     print("ESP32 Serial RX:", line)  # Show serial prints in console for live debugging
                 
+                # Expected format from ESP32: "BLYNK,V20,val" or "BLYNK,V27,val"
+                if line.startswith("BLYNK,"):
+                    parts = line.split(",")
+                    if len(parts) >= 3:
+                        pin_str = parts[1]
+                        val_str = parts[2]
+                        try:
+                            val = int(val_str)
+                            if pin_str == "V27": # Security Mode Switch
+                                security_mode_enabled = (val == 1)
+                                if not security_mode_enabled and emergency_active:
+                                    clear_emergency()
+                                status_message = f"SECURITY: {'ARMED' if security_mode_enabled else 'DISARMED'}"
+                                status_msg_time = time.time()
+                        except ValueError:
+                            pass
+
                 # Expected format from ESP32: "SENSOR,ldr_val,pir_val,acs_val"
-                if line.startswith("SENSOR,"):
+                elif line.startswith("SENSOR,"):
                     parts = line.split(",")
                     try:
                         if len(parts) >= 3:
@@ -231,25 +351,32 @@ while True:
                             if pir_val == 1:
                                 last_motion_time = current_time
                             
-                            # Logic 1: If PIR detects motion (1), turn light ON
-                            if pir_val == 1:
-                                if not light_on:
-                                    send_command("LIGHT_ON")
-                                    send_command("RELAY_ON")
-                                    light_on = True
-                                    relay_state = "ON"
-                                    status_message = "SENSORS -> LIGHT & RELAY ON"
-                                    status_msg_time = current_time
-                            
-                            # Logic 2: If no motion for > MOTION_TIMEOUT (200s), turn light OFF automatically
-                            elif current_time - last_motion_time > MOTION_TIMEOUT:
-                                if light_on:
-                                    send_command("LIGHT_OFF")
-                                    send_command("RELAY_OFF")
-                                    light_on = False
-                                    relay_state = "OFF"
-                                    status_message = "SENSORS -> LIGHT & RELAY OFF"
-                                    status_msg_time = current_time
+                            # Emergency Trigger Check (Triggers ONLY when Security Mode is ARMED)
+                            if pir_val == 1 and not emergency_active:
+                                if security_mode_enabled:
+                                    trigger_emergency()
+
+                            # If emergency is not active, run normal motion control logic
+                            if not emergency_active:
+                                # Logic 1: If PIR detects motion (1), turn light ON
+                                if pir_val == 1:
+                                    if not light_on:
+                                        send_command("LIGHT_ON")
+                                        send_command("RELAY_ON")
+                                        light_on = True
+                                        relay_state = "ON"
+                                        status_message = "SENSORS -> LIGHT & RELAY ON"
+                                        status_msg_time = current_time
+                                
+                                # Logic 2: If no motion for > MOTION_TIMEOUT (200s), turn light OFF automatically
+                                elif current_time - last_motion_time > MOTION_TIMEOUT:
+                                    if light_on:
+                                        send_command("LIGHT_OFF")
+                                        send_command("RELAY_OFF")
+                                        light_on = False
+                                        relay_state = "OFF"
+                                        status_message = "SENSORS -> LIGHT & RELAY OFF"
+                                        status_msg_time = current_time
                     except ValueError as ve:
                         print(f"Warning: Error parsing sensor values: {ve}")
         except Exception as e:
@@ -291,7 +418,7 @@ while True:
                 if blink_counter == 1:
                     last_blink_time = current_time
                 elif blink_counter == 2:
-                    if current_time - last_blink_time <= blink_window:
+                    if current_time - last_blink_time <= blink_window and not emergency_active:
                         if light_on:
                             send_command("LIGHT_OFF")
                             send_command("RELAY_OFF")
@@ -324,7 +451,7 @@ while True:
         mouth_ratio = mouth_dist / eye_dist
         mouth_open = mouth_ratio > 0.15
 
-        if mouth_open:
+        if mouth_open and not emergency_active:
             if current_time - last_color_shift_time > COLOR_SHIFT_INTERVAL:
                 # Shift color dynamically when mouth is open (larger step to show distinction, but paced by interval)
                 hue = (hue + 16) % 256
@@ -344,7 +471,7 @@ while True:
         if face_width > 0:
             smile_ratio = mouth_width / face_width
             is_smiling = smile_ratio > 0.45
-            if is_smiling and current_mode != "RELAX":
+            if is_smiling and current_mode != "RELAX" and not emergency_active:
                 current_mode = "RELAX"
                 send_command("MODE_RELAX")
                 status_message = "MODE: RELAX (Smile)"
@@ -380,7 +507,7 @@ while True:
 
             # Step-based brightness control using Left and Right Hand Pinches
             current_time = time.time()
-            if is_pinching:
+            if is_pinching and not emergency_active:
                 # Check screen side to identify Left Hand vs Right Hand status
                 if wrist.x < 0.5:
                     left_hand_pinch = True
@@ -399,9 +526,9 @@ while True:
 
     # Draw Status Dashboard Overlay (Aesthetic Sidebar)
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (320, 355), (25, 25, 25), -1)
+    cv2.rectangle(overlay, (10, 10), (320, 410), (25, 25, 25), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    cv2.rectangle(frame, (10, 10), (320, 355), (100, 100, 100), 1)
+    cv2.rectangle(frame, (10, 10), (320, 410), (100, 100, 100), 1)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     cv2.putText(frame, "AI SMART LED SYSTEM", (20, 32), font, 0.6, (255, 255, 255), 2)
@@ -433,6 +560,7 @@ while True:
     lh_color = (0, 255, 0) if left_hand_pinch else (180, 180, 180)
     cv2.putText(frame, f"Left Hand: {lh_status}", (20, 185), font, 0.5, lh_color, 1)
 
+    # Right Hand Pinch
     rh_status = "PINCHING" if right_hand_pinch else "OPEN"
     rh_color = (0, 255, 0) if right_hand_pinch else (180, 180, 180)
     cv2.putText(frame, f"Right Hand: {rh_status}", (20, 215), font, 0.5, rh_color, 1)
@@ -448,9 +576,19 @@ while True:
     relay_color = (0, 255, 0) if relay_state == "ON" else (0, 0, 255)
     cv2.putText(frame, f"Relay State: {relay_state}", (20, 335), font, 0.5, relay_color, 2)
 
+    # Security armed status
+    sec_color = (0, 255, 0) if security_mode_enabled else (180, 180, 180)
+    sec_status = "ARMED" if security_mode_enabled else "DISARMED"
+    cv2.putText(frame, f"Security Mode: {sec_status}", (20, 360), font, 0.5, sec_color, 2)
+
+    # Emergency Flashing Overlay Warning
+    if emergency_active:
+        if int(time.time() * 2.5) % 2 == 0:
+            cv2.putText(frame, "EMERGENCY ACTIVE", (350, 45), font, 0.7, (0, 0, 255), 2)
+
     # Status Notification Message
     if time.time() - status_msg_time < 1.5:
-        cv2.putText(frame, status_message, (15, 385), font, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, status_message, (15, 435), font, 0.6, (0, 255, 255), 2)
 
     cv2.imshow("AI Smart Control", frame)
 
@@ -473,11 +611,17 @@ while True:
         status_msg_time = time.time()
     elif key == ord('r'):
         current_mode = "NORMAL"
+        send_command("MODE_NORMAL")
         status_message = "MODE: NORMAL"
+        status_msg_time = time.time()
+    elif key == ord('y'):
+        security_mode_enabled = not security_mode_enabled
+        if not security_mode_enabled and emergency_active:
+            clear_emergency()
+        status_message = f"SECURITY: {'ARMED' if security_mode_enabled else 'DISARMED'}"
         status_msg_time = time.time()
 
 cap.release()
 cv2.destroyAllWindows()
 if esp32:
     esp32.close()
-    
