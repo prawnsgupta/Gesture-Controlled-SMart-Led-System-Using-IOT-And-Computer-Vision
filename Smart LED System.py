@@ -4,20 +4,59 @@ import serial
 import time
 import math
 import collections
+import numpy as np
 
 # ==========================
-# ESP32 SERIAL
+# ESP32 SERIAL CONFIGURATION
 # ==========================
 
-PORT = "COM10"
+import serial.tools.list_ports
 
-try:
-    esp32 = serial.Serial(PORT, 115200)
-    time.sleep(2)
-    print(f"Connected to ESP32 on {PORT}")
-except Exception as e:
-    print(f"Warning: Could not connect to ESP32 on {PORT}. Serial commands will be mocked. Error: {e}")
-    esp32 = None
+# Manual COM port setting (e.g., "COM3", "COM10"). Set to "" or None for auto-detection.
+ESP32_PORT = ""
+
+# Time in seconds of no motion before turning off the lights (e.g. 10 for demo, 300 for 5 minutes)
+MOTION_TIMEOUT = 200
+
+esp32 = None
+
+if ESP32_PORT:
+    print(f"Attempting connection to configured ESP32 port: {ESP32_PORT}...")
+    try:
+        s = serial.Serial(ESP32_PORT, 115200, timeout=0.05)
+        time.sleep(2)
+        s.write(b"\n")
+        print(f"--> SUCCESS: Connected to ESP32 on configured port {ESP32_PORT}!")
+        esp32 = s
+    except Exception as e:
+        print(f"Could not connect to configured port {ESP32_PORT}: {e}")
+
+if not esp32:
+    ports = list(serial.tools.list_ports.comports())
+    print("Scanning available COM ports...")
+    for p in ports:
+        print(f"Found: {p.device} - {p.description}")
+
+    # Try to connect to the ESP32
+    for p in ports:
+        # Skip standard bluetooth ports as they cause slow timeouts
+        if "Bluetooth" in p.description or "Standard Serial over Bluetooth" in p.description:
+            continue
+        
+        print(f"Attempting to connect to {p.device}...")
+        try:
+            # Set timeout to 0.05s to prevent blocking on serial reads
+            s = serial.Serial(p.device, 115200, timeout=0.05)
+            time.sleep(2)
+            s.write(b"\n")
+            print(f"--> SUCCESS: Connected to ESP32 on {p.device}!")
+            esp32 = s
+            break
+        except Exception as e:
+            print(f"Could not connect on {p.device}: {e}")
+
+if not esp32:
+    print("Warning: Could not connect to any ESP32 COM port. Serial commands will be mocked.")
 
 # ==========================
 # MEDIAPIPE INITIALIZATION
@@ -46,6 +85,16 @@ mp_drawing_styles = mp.solutions.drawing_styles
 # ==========================
 
 cap = cv2.VideoCapture(0)
+# Give camera a moment to release and initialize if busy
+for i in range(3):
+    if cap.isOpened():
+        break
+    print("Camera busy, retrying in 1s...")
+    time.sleep(1)
+    cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    print("Error: Could not open webcam.")
 
 last_command = ""
 last_write_time = 0
@@ -56,12 +105,16 @@ write_interval = 0.05  # 50ms rate limit to prevent flooding the serial port
 # ==========================
 
 def send_command(cmd, force=False):
-    global last_command, last_write_time
+    global last_command, last_write_time, esp32
     current_time = time.time()
     if cmd != last_command or force:
         if force or (current_time - last_write_time >= write_interval):
             if esp32:
-                esp32.write((cmd + "\n").encode())
+                try:
+                    esp32.write((cmd + "\n").encode())
+                except Exception as e:
+                    print(f"Warning: Serial connection lost while writing. Switching to mock mode. Error: {e}")
+                    esp32 = None
             print("Sent:", cmd)
             last_command = cmd
             last_write_time = current_time
@@ -108,6 +161,12 @@ light_on = True
 # Color shifting state (HSV Hue 0-255)
 hue = 15  # Start warm (orange)
 head_roll = 0.0
+last_color_shift_time = 0
+COLOR_SHIFT_INTERVAL = 0.5  # shift color every 0.5s so user can select/stop on one
+
+# Mode state
+current_mode = "NORMAL"
+last_energy_cmd_time = 0
 
 # Pinch gestures timing
 last_left_pinch_time = 0
@@ -117,6 +176,13 @@ pinch_cooldown = 0.25  # seconds
 # Overlay status messaging
 status_message = ""
 status_msg_time = 0
+
+# LDR, PIR, ACS712 & Relay tracking
+last_motion_time = time.time()
+ldr_val = 0    # Default initial value showing optimal light (0 = Light, 1 = Dark)
+pir_val = 0    # Default no motion detected
+acs_val = 0    # Default raw current sensor reading
+relay_state = "OFF" # Default relay state
 
 # ==========================
 # MAIN LOOP
@@ -130,6 +196,65 @@ while True:
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Energy Saving Mode: Automatic brightness based on ambient light
+    if current_mode == "ENERGY":
+        current_time = time.time()
+        if current_time - last_energy_cmd_time > 1.0: # Update every 1 second
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            avg_brightness = np.mean(gray)
+            # Map avg_brightness (0-255) to LED brightness (255-20) inversely
+            target_brightness = int(np.interp(avg_brightness, [50, 200], [255, 20]))
+            send_command(f"BRIGHTNESS,{target_brightness}")
+            last_energy_cmd_time = current_time
+
+    # Read sensor data from ESP32 if available (non-blocking)
+    if esp32:
+        try:
+            while esp32.in_waiting > 0:
+                line = esp32.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    print("ESP32 Serial RX:", line)  # Show serial prints in console for live debugging
+                
+                # Expected format from ESP32: "SENSOR,ldr_val,pir_val,acs_val"
+                if line.startswith("SENSOR,"):
+                    parts = line.split(",")
+                    try:
+                        if len(parts) >= 3:
+                            ldr_val = int(parts[1])
+                            pir_val = int(parts[2])
+                            if len(parts) >= 4:
+                                acs_val = int(parts[3])
+                            
+                            current_time = time.time()
+                            
+                            if pir_val == 1:
+                                last_motion_time = current_time
+                            
+                            # Logic 1: If PIR detects motion (1), turn light ON
+                            if pir_val == 1:
+                                if not light_on:
+                                    send_command("LIGHT_ON")
+                                    send_command("RELAY_ON")
+                                    light_on = True
+                                    relay_state = "ON"
+                                    status_message = "SENSORS -> LIGHT & RELAY ON"
+                                    status_msg_time = current_time
+                            
+                            # Logic 2: If no motion for > MOTION_TIMEOUT (200s), turn light OFF automatically
+                            elif current_time - last_motion_time > MOTION_TIMEOUT:
+                                if light_on:
+                                    send_command("LIGHT_OFF")
+                                    send_command("RELAY_OFF")
+                                    light_on = False
+                                    relay_state = "OFF"
+                                    status_message = "SENSORS -> LIGHT & RELAY OFF"
+                                    status_msg_time = current_time
+                    except ValueError as ve:
+                        print(f"Warning: Error parsing sensor values: {ve}")
+        except Exception as e:
+            print(f"Warning: Serial connection lost while reading. Switching to mock mode. Error: {e}")
+            esp32 = None
 
     # Process models
     results_face = face_mesh.process(rgb)
@@ -169,16 +294,20 @@ while True:
                     if current_time - last_blink_time <= blink_window:
                         if light_on:
                             send_command("LIGHT_OFF")
+                            send_command("RELAY_OFF")
                             light_on = False
-                            status_message = "BLINK 2x -> LIGHT OFF"
+                            relay_state = "OFF"
+                            status_message = "BLINK 2x -> LIGHT & RELAY OFF"
                             status_msg_time = current_time
-                            print("Action: LIGHT OFF")
+                            print("Action: LIGHT & RELAY OFF")
                         else:
                             send_command("LIGHT_ON")
+                            send_command("RELAY_ON")
                             light_on = True
-                            status_message = "BLINK 2x -> LIGHT ON"
+                            relay_state = "ON"
+                            status_message = "BLINK 2x -> LIGHT & RELAY ON"
                             status_msg_time = current_time
-                            print("Action: LIGHT ON")
+                            print("Action: LIGHT & RELAY ON")
                         blink_counter = 0
                     else:
                         last_blink_time = current_time
@@ -196,11 +325,30 @@ while True:
         mouth_open = mouth_ratio > 0.15
 
         if mouth_open:
-            # Shift color dynamically when mouth is open
-            hue = (hue + 4) % 256
-            send_command(f"HSV,{hue},255,255")
-            status_message = f"MOUTH OPEN -> COLOR (Hue: {hue})"
-            status_msg_time = current_time
+            if current_time - last_color_shift_time > COLOR_SHIFT_INTERVAL:
+                # Shift color dynamically when mouth is open (larger step to show distinction, but paced by interval)
+                hue = (hue + 16) % 256
+                send_command(f"HSV,{hue},255,255")
+                status_message = f"MOUTH OPEN -> COLOR (Hue: {hue})"
+                status_msg_time = current_time
+                last_color_shift_time = current_time
+                
+        # Smile detection for Relax Mode (Mouth corners 61 and 291)
+        left_mouth = face.landmark[61]
+        right_mouth = face.landmark[291]
+        left_cheek = face.landmark[234]
+        right_cheek = face.landmark[454]
+        mouth_width = get_distance(left_mouth, right_mouth)
+        face_width = get_distance(left_cheek, right_cheek)
+        
+        if face_width > 0:
+            smile_ratio = mouth_width / face_width
+            is_smiling = smile_ratio > 0.45
+            if is_smiling and current_mode != "RELAX":
+                current_mode = "RELAX"
+                send_command("MODE_RELAX")
+                status_message = "MODE: RELAX (Smile)"
+                status_msg_time = current_time
 
     # Hand movement & pinch detection
     if results_hands.multi_hand_landmarks:
@@ -230,34 +378,30 @@ while True:
             cv2.circle(frame, (tx, ty), 5, line_color, -1)
             cv2.circle(frame, (ix, iy), 5, line_color, -1)
 
-            # Use screen side to identify Left Hand vs Right Hand
+            # Step-based brightness control using Left and Right Hand Pinches
             current_time = time.time()
-            if wrist.x < 0.5:
-                left_hand_pinch = is_pinching
-            else:
-                right_hand_pinch = is_pinching
-
             if is_pinching:
-                # Pinch Y controls brightness (higher hand = brighter)
-                pinch_y = (thumb_tip.y + index_tip.y) / 2.0
-                y_val = max(0.2, min(0.8, pinch_y))
-                normalized_y = (0.8 - y_val) / 0.6  # 1.0 at y=0.2 (top), 0.0 at y=0.8 (bottom)
-                target_brightness = int(5 + normalized_y * 250)
-                
-                send_command(f"BRIGHTNESS,{target_brightness}")
-                status_message = f"PINCH -> BRIGHTNESS {target_brightness}"
-                status_msg_time = current_time
-                
-                # Draw pinch indicator on the frame
-                px, py = int((thumb_tip.x + index_tip.x) / 2 * w), int(pinch_y * h)
-                cv2.circle(frame, (px, py), 8, (0, 255, 0), -1)
-                cv2.putText(frame, f"Brightness: {target_brightness}", (px + 15, py + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Check screen side to identify Left Hand vs Right Hand status
+                if wrist.x < 0.5:
+                    left_hand_pinch = True
+                    if current_time - last_left_pinch_time > pinch_cooldown:
+                        send_command("BRIGHTNESS_DOWN")
+                        last_left_pinch_time = current_time
+                        status_message = "LEFT PINCH -> BRIGHTNESS DOWN"
+                        status_msg_time = current_time
+                else:
+                    right_hand_pinch = True
+                    if current_time - last_right_pinch_time > pinch_cooldown:
+                        send_command("BRIGHTNESS_UP")
+                        last_right_pinch_time = current_time
+                        status_message = "RIGHT PINCH -> BRIGHTNESS UP"
+                        status_msg_time = current_time
 
     # Draw Status Dashboard Overlay (Aesthetic Sidebar)
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (320, 235), (25, 25, 25), -1)
+    cv2.rectangle(overlay, (10, 10), (320, 355), (25, 25, 25), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    cv2.rectangle(frame, (10, 10), (320, 235), (100, 100, 100), 1)
+    cv2.rectangle(frame, (10, 10), (320, 355), (100, 100, 100), 1)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     cv2.putText(frame, "AI SMART LED SYSTEM", (20, 32), font, 0.6, (255, 255, 255), 2)
@@ -270,6 +414,9 @@ while True:
 
     # Active Color / Last Command
     cv2.putText(frame, f"Last Command: {last_command}", (20, 95), font, 0.5, (255, 255, 255), 1)
+    
+    # Active Mode
+    cv2.putText(frame, f"Mode: {current_mode}", (180, 95), font, 0.5, (255, 0, 255), 2)
 
     # EAR and Blink tracking
     cv2.putText(frame, f"Eye EAR: {avg_EAR:.2f}", (20, 125), font, 0.5, (255, 255, 255), 1)
@@ -290,17 +437,47 @@ while True:
     rh_color = (0, 255, 0) if right_hand_pinch else (180, 180, 180)
     cv2.putText(frame, f"Right Hand: {rh_status}", (20, 215), font, 0.5, rh_color, 1)
 
+    # LDR and PIR readings
+    cv2.putText(frame, f"LDR Light: {ldr_val}", (20, 245), font, 0.5, (255, 255, 255), 1)
+    motion_status = "DETECTED" if pir_val == 1 else "NO MOTION"
+    motion_color = (0, 255, 0) if pir_val == 1 else (180, 180, 180)
+    cv2.putText(frame, f"PIR Motion: {motion_status}", (20, 275), font, 0.5, motion_color, 1)
+
+    # ACS and Relay readings
+    cv2.putText(frame, f"ACS Current: {acs_val}", (20, 305), font, 0.5, (255, 255, 255), 1)
+    relay_color = (0, 255, 0) if relay_state == "ON" else (0, 0, 255)
+    cv2.putText(frame, f"Relay State: {relay_state}", (20, 335), font, 0.5, relay_color, 2)
+
     # Status Notification Message
     if time.time() - status_msg_time < 1.5:
-        cv2.putText(frame, status_message, (15, 255), font, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, status_message, (15, 385), font, 0.6, (0, 255, 255), 2)
 
     cv2.imshow("AI Smart Control", frame)
 
     key = cv2.waitKey(1)
     if key == 27:  # ESC key
         break
+    elif key == ord('s'):
+        current_mode = "STUDY"
+        send_command("MODE_STUDY")
+        status_message = "MODE: STUDY"
+        status_msg_time = time.time()
+    elif key == ord('n'):
+        current_mode = "NIGHT"
+        send_command("MODE_NIGHT")
+        status_message = "MODE: NIGHT"
+        status_msg_time = time.time()
+    elif key == ord('e'):
+        current_mode = "ENERGY"
+        status_message = "MODE: ENERGY SAVING"
+        status_msg_time = time.time()
+    elif key == ord('r'):
+        current_mode = "NORMAL"
+        status_message = "MODE: NORMAL"
+        status_msg_time = time.time()
 
 cap.release()
 cv2.destroyAllWindows()
 if esp32:
     esp32.close()
+    
